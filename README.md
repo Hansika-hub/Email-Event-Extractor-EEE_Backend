@@ -1,38 +1,65 @@
-# Event Email Extraction (EEE) — Frontend Client
+# Event Email Extraction (EEE) — Backend API
 
-A responsive, visually premium web dashboard that serves as the user interface for the **Event Email Extraction (EEE) - Event Reminder** application. 
+The Flask web service backend that powers the **Event Email Extraction (EEE) - Event Reminder** application. 
 
-This client communicates with Google's authentication systems, pulls event-related emails, displays processed events extracted from those emails, schedules push notifications, and allows users to manually manage custom reminders.
+This backend acts as the extraction pipeline, communicating with the Gmail API to pull unread messages and processing their content to extract event information (`date`, `time`, and `venue`) via a multi-tiered pipeline consisting of rules, a custom NER (Named Entity Recognition) model, and a generative LLM (Gemini) fallback.
 
 ---
 
-## 🚀 Key Features
+## 🚀 Core Features
 
-*   **Google Auth Integration**: Employs the modern **Google Identity Services (GSI)** SDK to authorize Gmail read scopes (`gmail.readonly`) securely.
-*   **Collapsible Sidebar Drawer**: Houses quick status filters (Upcoming, Attended, Missed counts) and Google login/logout configurations.
-*   **Events Grid & Search**: Displays extraction results (Event name, date, time, venue) with support for real-time text-based search.
-*   **Custom Reminders**: A modal interface that lets users manually insert custom events (with offline scheduling).
-*   **Local Notifications**: Requests browser notifications permissions and schedules automatic desktop alerts 60, 15, and 5 minutes prior to scheduled event times.
-*   **Responsive Styling**: Engineered using modern Vanilla CSS with a responsive layout, purple/lavender gradient design, micro-animations, and fluid state changes.
+*   **Secure Session & OAuth Flow**: Verifies Google Identity ID tokens and validates user authentication.
+*   **Gmail Integration**: Reads unread mail headers, decodes text/html payloads, and extracts attached or embedded ICS calendar events.
+*   **Hybrid Extraction Pipeline**:
+    1.  **Rule-based parser**: Uses `dateparser` and regex heuristics to look for dates, times, and venue keywords (hall, room, lab, etc.) within line proximity.
+    2.  **NER Model**: Submits texts to a custom DistilBERT model (`Thiyaga158/Distilbert_Ner_Model_For_Email_Event_Extraction`) hosted on the Hugging Face Inference API.
+    3.  **LLM Fallback (Gemini)**: Utilizes `gemini-1.5-flash` to extract structured details from complex or unstructured email layouts.
+*   **SQLite Storage**: Saves successfully parsed event objects to a local sqlite database (`events.db`).
+*   **Auto-Cleanup Scheduler**: Deletes expired event entries (older than 1 hour past the event execution window).
+*   **Cache Optimization**: Caches Gmail messages by message ID to prevent duplicate extraction requests.
 
 ---
 
 ## 🛠️ Technology Stack
 
-*   **Markup**: HTML5 (Semantic tags, Modal dialogs)
-*   **Styling**: Custom CSS (CSS grid/flexbox, transitions, custom gradients, mobile responsiveness)
-*   **Logic**: Pure Vanilla ES6 JavaScript (Google API SDKs, LocalStorage cache layer, Notification APIs)
-*   **Hosting Configuration**: Vercel configuration (`vercel.json`)
+*   **Language**: Python 3.10
+*   **Framework**: Flask (with Flask-CORS)
+*   **Libraries**:
+    *   `google-api-python-client` & `google-auth` (Gmail API client)
+    *   `google-generativeai` (Gemini API integration)
+    *   `dateparser` (semantic date searches)
+    *   `beautifulsoup4` (cleaning HTML formatting)
+    *   `icalendar` (ICS attachments parsing)
+    *   `sqlite3` (database storage)
+*   **Deployment Configuration**: Render blueprint (`render.yaml`)
 
 ---
 
-## 📦 File Structure
+## 🗺️ API Endpoints
 
-*   `index.html` — Main layout containing sidebars, grid systems, and custom event modals.
-*   `policy.html` — Privacy policy highlighting permissions requested (`gmail.readonly` and `userinfo.email`).
-*   `Proemail.css` — Core style design system with typography, gradients, animations, and layouts.
-*   `Proemail.js` — Core application script coordinating Auth callbacks, event fetching, localStorage caching, custom validations, and browser notifications.
-*   `vercel.json` — Vercel config. Sets strict Content-Security-Policy (CSP) headers and rewrites `/api/*` requests to the external backend service to bypass CORS restrictions.
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/` | Health check endpoint. |
+| `POST` | `/` | Google ID Token authentication. |
+| `GET/POST`| `/fetch_emails` | Retrieves subjects and IDs of up to 10 unread emails. |
+| `GET/POST`| `/process_emails`| Pulls emails, decodes text/ICS, runs extraction pipeline, writes to DB, returns list of events. |
+| `GET/POST`| `/debug_token` | Debugs credentials by querying Google Tokeninfo. |
+| `POST` | `/cleanup_reminders` | Clears expired event entries from SQLite. |
+
+---
+
+## ⚙️ Environment Variables
+
+Create a `.env` file in the root folder to configure the backend:
+
+```env
+PORT=5000
+GOOGLE_API_KEY=your_gemini_api_key_here
+LLM_FALLBACK_ENABLED=true
+LLM_FIRST=false
+HUGGINGFACE_API_TOKEN=your_huggingface_token_here
+DEBUG_NER=0
+```
 
 ---
 
@@ -40,33 +67,34 @@ This client communicates with Google's authentication systems, pulls event-relat
 
 1.  **Clone the Repository**:
     ```bash
-    git clone https://github.com/Hansika-hub/Email.git
-    cd Email
+    git clone https://github.com/Hansika-hub/Email_Backend.git
+    cd Email_Backend
     ```
 
-2.  **Run a Static Server**:
-    Since this is a client-only static project, you can host it locally using standard utilities:
-    *   **Using Python**:
-        ```bash
-        python3 -m http.server 3000
-        ```
-    *   **Using Node/npx**:
-        ```bash
-        npx serve -l 3000
-        ```
+2.  **Set Up Virtual Environment**:
+    ```bash
+    python3 -m venv venv
+    source venv/bin/activate
+    ```
 
-3.  **Access the Dashboard**:
-    Open [http://localhost:3000](http://localhost:3000) in your web browser.
+3.  **Install Dependencies**:
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+4.  **Configure Environment**:
+    Rename/create `.env` and fill in your API tokens.
+
+5.  **Run the Server**:
+    ```bash
+    python app.py
+    ```
+    The application will launch on `http://localhost:5000`.
 
 ---
 
-## 🌐 Deployment
+## ☁️ Deployment
 
-This application is ready to deploy on **Vercel**:
-*   The `vercel.json` file is configured out-of-the-box.
-*   It routes API endpoints via rewrites to the deployed backend on Render: `https://email-backend-bu9l.onrender.com`.
-*   To deploy, run:
-    ```bash
-    npm install -g vercel
-    vercel
-    ```
+This service can be easily deployed to **Render** using the included `render.yaml` configuration:
+*   The blueprint provisions a python web service named `eee-backend`.
+*   Includes build scripting and registers target environment variables (`HF_MODEL_ID`, etc.).
