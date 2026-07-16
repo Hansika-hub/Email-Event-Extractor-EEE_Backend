@@ -138,6 +138,11 @@ def _extract_event_from_ics(ics_text: str) -> dict:
 if os.getenv("DEBUG_NER", "0") not in (None, "", "0", "false", "False"):
     logging.basicConfig(level=logging.INFO, format='%(message)s')
 
+# ✅ Health check endpoint for Render
+@app.route("/", methods=["GET"])
+def health_check():
+    return jsonify({"status": "healthy", "message": "Email Event Extractor API is running"}), 200
+
 # ✅ Optional: Block non-JSON POST requests
 @app.before_request
 def block_non_json_post():
