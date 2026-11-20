@@ -3,11 +3,13 @@ from gmail_utils import get_gmail_service
 from extractor import extract_event_details, is_event_like, count_event_fields
 from flask_cors import CORS
 import os
-from db_utils import save_to_db
+from db_utils import DB_NAME, save_to_db
 import requests
 import logging
 import base64
-from time import monotonic
+from threading import BoundedSemaphore
+import sqlite3
+import json
 import re
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -39,12 +41,31 @@ CORS(
     methods=["GET", "POST", "OPTIONS"],
 )
 
-all_events = []
-PROCESSED_CACHE = {}
+scan_slot = BoundedSemaphore(1)
+
+
+def cached_event(mailbox, message_id):
+    # Store results on disk so repeated mailboxes do not grow the worker heap.
+    with sqlite3.connect(DB_NAME) as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS extraction_cache (
+            mailbox TEXT, message_id TEXT, updated INTEGER, result TEXT,
+            PRIMARY KEY (mailbox, message_id))""")
+        row = db.execute("""SELECT result, updated > strftime('%s','now') - 300
+                            FROM extraction_cache WHERE mailbox=? AND message_id=?""",
+                         (mailbox, message_id)).fetchone()
+    return (json.loads(row[0]) if row and row[1] else None, bool(row))
+
+
+def cache_event(mailbox, message_id, result):
+    with sqlite3.connect(DB_NAME) as db:
+        db.execute("""INSERT OR REPLACE INTO extraction_cache VALUES
+                      (?, ?, strftime('%s','now'), ?)""", (mailbox, message_id, json.dumps(result)))
+
+
 # ---- Helpers to extract readable body text from Gmail payload ----
-def _decode_base64_to_text(data: str) -> str:
+def _decode_base64_to_text(data: str, max_encoded=None) -> str:
     try:
-        return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+        return base64.urlsafe_b64decode(data[:max_encoded]).decode("utf-8", errors="ignore")
     except Exception:
         return ""
 
@@ -66,10 +87,10 @@ def _walk_parts_for_text(payload: dict) -> str:
         return ""
     # Prefer text/plain
     if payload.get("mimeType") == "text/plain" and payload.get("body", {}).get("data"):
-        return _decode_base64_to_text(payload["body"]["data"]) or ""
+        return _decode_base64_to_text(payload["body"]["data"], 131072) or ""
     # Fallback text/html
     if payload.get("mimeType") == "text/html" and payload.get("body", {}).get("data"):
-        html = _decode_base64_to_text(payload["body"]["data"]) or ""
+        html = _decode_base64_to_text(payload["body"]["data"], 131072) or ""
         return _strip_html(html)
     # Recurse into parts
     for part in (payload.get("parts") or []):
@@ -78,7 +99,7 @@ def _walk_parts_for_text(payload: dict) -> str:
             return text
     # Last resort: body at this level
     if payload.get("body", {}).get("data"):
-        return _decode_base64_to_text(payload["body"]["data"]) or ""
+        return _decode_base64_to_text(payload["body"]["data"], 131072) or ""
     return ""
 
 def _walk_parts_for_calendar(payload: dict) -> str:
@@ -275,6 +296,9 @@ def process_all_emails():
             "hint": "Send a Gmail OAuth access token via Authorization: Bearer <token> or JSON {accessToken}. An ID token will not work for Gmail API."
         }), 401
 
+    if not scan_slot.acquire(blocking=False):
+        return jsonify({"error": "An email scan is in progress. Please retry shortly."}), 429, {"Retry-After": "5"}
+
     try:
         creds = Credentials(token=access_token)
         service = build("gmail", "v1", credentials=creds)
@@ -289,9 +313,9 @@ def process_all_emails():
         for msg in messages:
             try:
                 key = (mailbox, msg["id"])
-                cached = PROCESSED_CACHE.get(key)
-                if cached and monotonic() - cached[0] < 300:
-                    extracted.append(cached[1])
+                cached, previously_saved = cached_event(*key)
+                if cached is not None:
+                    extracted.append(cached)
                     continue
                 msg_detail = service.users().messages().get(
                     userId="me", id=msg["id"], format="full"
@@ -325,9 +349,9 @@ def process_all_emails():
                     if count_event_fields(result) >= 3:
                         result["attendees"] = 1
                     extracted.append(result)
-                    if key not in PROCESSED_CACHE:
+                    if not previously_saved:
                         save_to_db(result)
-                    PROCESSED_CACHE[key] = (monotonic(), result)
+                    cache_event(*key, result)
                 else:
                     logging.info("Skipped email with insufficient event evidence")
 
@@ -344,6 +368,8 @@ def process_all_emails():
             "error": "Failed to process emails",
             "hint": "Ensure the provided token is a Gmail OAuth access token with gmail.readonly scope."
         }), 401
+    finally:
+        scan_slot.release()
 
 
 @app.route("/cleanup_reminders", methods=["POST"])
