@@ -205,7 +205,7 @@ def extract_venue(text: str, anchor_line_index: Optional[int] = None) -> Optiona
 
 
 # ---------- Hugging Face Inference API (primary) ----------
-HF_MODEL_ID = os.getenv("HF_MODEL_ID", "Thiyaga158/Distilbert_Ner_Model_For_Email_Event_Extraction")
+HF_MODEL_ID = os.getenv("HF_MODEL_ID", "Hansika08/Distilbert-case-based_Fine-tuned_NER")
 HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}"
 
 def _call_hf_ner(text: str, timeout_seconds: int = 8) -> Optional[List[Dict[str, Any]]]:
