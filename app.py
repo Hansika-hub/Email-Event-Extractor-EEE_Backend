@@ -7,13 +7,15 @@ from db_utils import save_to_db
 import requests
 import logging
 import base64
+from time import monotonic
 import re
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from icalendar import Calendar
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 app = Flask(__name__)
 app.secret_key = "super_secret"
@@ -57,7 +59,7 @@ def _strip_html(html: str) -> str:
     # Strip tags
     text = re.sub(r"<[^>]+>", " ", html)
     # Collapse whitespace
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"[^\S\n]+", " ", text).strip()
 
 def _walk_parts_for_text(payload: dict) -> str:
     if not payload:
@@ -129,6 +131,8 @@ def _extract_event_from_ics(ics_text: str) -> dict:
             "date": date_str,
             "time": time_str,
             "venue": venue,
+            "all_day": bool(date_str and not time_str),
+            "timezone": (getattr(val.tzinfo, "key", None) or getattr(val.tzinfo, "zone", None) or ("UTC" if val.utcoffset() == timezone.utc.utcoffset(None) else None)) if time_str else None,
             "source": "ics",
             "confidence": 1.0 if date_str and (time_str or venue) else 0.9,
         }
@@ -279,10 +283,16 @@ def process_all_emails():
         ).execute()
         messages = results.get("messages", [])
         print(f"📥 Fetched unread messages: {len(messages)}")
+        mailbox = service.users().getProfile(userId="me").execute()["emailAddress"]
         extracted = []
 
         for msg in messages:
             try:
+                key = (mailbox, msg["id"])
+                cached = PROCESSED_CACHE.get(key)
+                if cached and monotonic() - cached[0] < 300:
+                    extracted.append(cached[1])
+                    continue
                 msg_detail = service.users().messages().get(
                     userId="me", id=msg["id"], format="full"
                 ).execute()
@@ -294,38 +304,32 @@ def process_all_emails():
                     "No Subject"
                 )
 
-                # Caching by Gmail message id
-                cache_key = msg["id"]
-                if cache_key in PROCESSED_CACHE:
-                    extracted.append(PROCESSED_CACHE[cache_key])
-                    continue
-
-                # Pipeline order: if LLM_FIRST=true, try text first then ICS; else ICS first
-                result = {}
-                if os.getenv("LLM_FIRST", "false").lower() == "true":
-                    body_data = _walk_parts_for_text(msg_detail.get("payload", {}))
-                    result = extract_event_details(subject, body_data)
-                    if not result or count_event_fields(result) < 2:
-                        ics_data = _walk_parts_for_calendar(msg_detail.get("payload", {}))
-                        if ics_data:
-                            result = _extract_event_from_ics(ics_data)
+                payload = msg_detail.get("payload", {})
+                ics_data = _walk_parts_for_calendar(payload)
+                structured = _extract_event_from_ics(ics_data) if ics_data else {}
+                if structured.get("date") and structured.get("event_name"):
+                    result = {**structured, "trace": ["ics"]}
                 else:
-                    ics_data = _walk_parts_for_calendar(msg_detail.get("payload", {}))
-                    if ics_data:
-                        result = _extract_event_from_ics(ics_data)
-                    if not result or count_event_fields(result) < 2:
-                        body_data = _walk_parts_for_text(msg_detail.get("payload", {}))
-                        result = extract_event_details(subject, body_data)
-
-                if is_event_like(result, minimum_required=2):
+                    stamp = next((h["value"] for h in headers if h["name"].lower() == "date"), "")
+                    try:
+                        reference = parsedate_to_datetime(stamp).replace(tzinfo=None)
+                    except (TypeError, ValueError, OverflowError):
+                        reference = datetime.fromtimestamp(int(msg_detail["internalDate"])/1000, timezone.utc).replace(tzinfo=None)
+                    result = extract_event_details(subject, _walk_parts_for_text(payload), reference)
+                    if structured:
+                        result.update({k:v for k,v in structured.items() if v is not None and k not in ("source","confidence")})
+                        result["trace"].insert(0, "ics (partial)")
+                if is_event_like(result) or (structured and result.get("date")):
+                    result["message_id"] = msg["id"]
                     # If all three present, mark attendees = 1 (legacy behavior)
                     if count_event_fields(result) >= 3:
                         result["attendees"] = 1
                     extracted.append(result)
-                    PROCESSED_CACHE[cache_key] = result
-                    save_to_db(result)
+                    if key not in PROCESSED_CACHE:
+                        save_to_db(result)
+                    PROCESSED_CACHE[key] = (monotonic(), result)
                 else:
-                    print(f"ℹ️ Skipping email due to insufficient fields (need >=2). Subject='{subject}', details={result}")
+                    logging.info("Skipped email with insufficient event evidence")
 
             except Exception as e:
                 print(f"⚠️ Skipping email due to error: {e}")
