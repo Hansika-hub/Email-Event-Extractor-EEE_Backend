@@ -53,4 +53,4 @@ Gemini fallback is optional. To enable it, set `LLM_FALLBACK_ENABLED=true`, `GEM
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/Hansika-hub/Email-Event-Extractor-EEE_Backend/blob/main/LICENSE.txt)
