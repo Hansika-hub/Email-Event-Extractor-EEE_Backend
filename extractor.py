@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from bs4 import BeautifulSoup
 from dateparser.search import search_dates
 import datetime as _dt
-import requests
+from functools import lru_cache
 import logging
 
 # Debug logging toggle
@@ -65,10 +65,10 @@ def _clean_text(html_or_text: Optional[str]) -> str:
         except Exception:
             pass
     # Collapse whitespace
-    txt = re.sub(r"\s+", " ", txt).strip()
+    txt = "\n".join(re.sub(r"[^\S\n]+", " ", line).strip() for line in txt.splitlines()).strip()
     return txt
 
-def _extract_date_and_time(text: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+def _extract_date_and_time(text: str, reference=None) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     """Extract date and time using a simple, reliable approach."""
     if not text:
         return None, None, None
@@ -80,6 +80,7 @@ def _extract_date_and_time(text: str) -> Tuple[Optional[str], Optional[str], Opt
         results = search_dates(text, settings={
             "RETURN_AS_TIMEZONE_AWARE": False,
             "PREFER_DATES_FROM": "future",
+            **({"RELATIVE_BASE": reference} if reference else {}),
             "DATE_ORDER": "DMY",  # Handle DD.MM.YYYY format better
             "PREFER_DAY_OF_MONTH": "first",
         }) or []
@@ -90,7 +91,7 @@ def _extract_date_and_time(text: str) -> Tuple[Optional[str], Optional[str], Opt
         return None, None, None
     
     # Get the best date (prefer future, then first)
-    now = _dt.datetime.now()
+    now = reference or _dt.datetime.now()
     future_dates = [dt for _, dt in results if dt >= now]
     best_date = future_dates[0] if future_dates else results[0][1]
     date_str = _normalize_date(best_date.date())
@@ -204,178 +205,76 @@ def extract_venue(text: str, anchor_line_index: Optional[int] = None) -> Optiona
     return None
 
 
-# ---------- Hugging Face Inference API (primary) ----------
-HF_MODEL_ID = os.getenv("HF_MODEL_ID", "Hansika08/Distilbert-case-based_Fine-tuned_NER")
-HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}"
+MODEL_ID = os.getenv("HF_MODEL_ID", "Hansika08/Distilbert-case-based_Fine-tuned_NER")
+LABEL_FIELDS = {
+    "EVENT": "event_name", "EVENT_NAME": "event_name", "EVENTNAME": "event_name",
+    "TITLE": "event_name", "DATE": "date", "TIME": "time", "LOCATION": "venue",
+    "LOC": "venue", "VENUE": "venue", "GPE": "venue", "FAC": "venue",
+}
 
-def _call_hf_ner(text: str, timeout_seconds: int = 8) -> Optional[List[Dict[str, Any]]]:
-    token = os.getenv("HUGGINGFACE_API_TOKEN") or os.getenv("HF_TOKEN")
+@lru_cache(maxsize=1)
+def load_ner():
+    from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
+    options = {"revision": os.getenv("HF_MODEL_REVISION", "main"),
+               "token": os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_TOKEN")}
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True, **options)
+    model, info = AutoModelForTokenClassification.from_pretrained(
+        MODEL_ID, output_loading_info=True, **options)
+    if any("classifier" in key for key in info["missing_keys"]):
+        raise ValueError("Missing trained token classifier weights")
+    if model.config.model_type != "distilbert":
+        raise ValueError("Expected a DistilBERT checkpoint")
+    mapping = {**LABEL_FIELDS, **json.loads(os.getenv("NER_LABEL_MAP", "{}"))}
+    labels = {re.sub(r"^[BI]-", "", label).upper() for label in model.config.id2label.values()}
+    unknown = labels - {"O"} - mapping.keys()
+    if unknown:
+        raise ValueError(f"Configure NER_LABEL_MAP for {sorted(unknown)}")
+    return pipeline("token-classification", model=model, tokenizer=tokenizer,
+                    aggregation_strategy="simple", stride=64, device=-1), mapping
+
+
+def extract_event_details(subject, body, reference=None):
+    text = _clean_text(body)
+    input_text = (subject or "") + "\n" + text
+    date, time, anchor = _extract_date_and_time(input_text, reference)
+    fields = {"event_name": None, "date": date, "time": time,
+              "venue": extract_venue(input_text, anchor)}
+    sources = {k: "rules" for k, v in fields.items() if v}
+    trace = ["rules"]
     try:
-        headers = {"Accept": "application/json"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-            _dlog("Calling HF Inference API with token")
-        else:
-            _dlog("Calling HF Inference API anonymously (no token)")
-        payload = {"inputs": text, "options": {"wait_for_model": True}}
-        resp = requests.post(HF_API_URL, headers=headers, json=payload, timeout=timeout_seconds)
-        _dlog(f"HF response status: {resp.status_code}")
-        if resp.status_code != 200:
-            try:
-                err = resp.json()
-                _dlog(f"HF error body: {err}")
-            except Exception:
-                _dlog("HF error: non-JSON response")
-            return None
-        data = resp.json()
-        # API can return a list or nested list depending on the pipeline; normalize to list
-        if isinstance(data, dict) and data.get("error"):
-            _dlog(f"HF returned error: {data.get('error')}")
-            return None
-        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
-            return data[0]
-        if isinstance(data, list):
-            return data
-        return None
-    except Exception:
-        _dlog("HF call raised exception; falling back")
-        return None
-
-
-def _aggregate_entities(entities: List[Dict[str, Any]]) -> Dict[str, str]:
-    # Merge adjacent tokens of the same entity_group
-    if not entities:
-        return {}
-    # Some APIs use 'entity' like 'B-DATE', others 'entity_group' like 'DATE'
-    normalized: List[Dict[str, Any]] = []
-    for ent in entities:
-        group = ent.get("entity_group") or (ent.get("entity") or "").split("-")[-1]
-        normalized.append({
-            "group": group,
-            "start": ent.get("start"),
-            "end": ent.get("end"),
-            "word": ent.get("word") or ent.get("token") or "",
-            "score": ent.get("score", 0.0)
-        })
-
-    normalized.sort(key=lambda e: (e.get("start") is None, e.get("start", 0)))
-
-    merged: List[Dict[str, Any]] = []
-    for ent in normalized:
-        if not merged:
-            merged.append(ent.copy())
-            continue
-        last = merged[-1]
-        if ent["group"] == last["group"] and last.get("end") == ent.get("start"):
-            last["end"] = ent.get("end")
-            last["word"] = (last.get("word") or "") + ("" if ent.get("word", "").startswith("##") else " ") + ent.get("word", "")
-        else:
-            merged.append(ent.copy())
-
-    # Map groups to fields
-    fields: Dict[str, str] = {}
-    def assign_first(key: str, value: str):
-        if value and key not in fields:
-            fields[key] = value.replace("##", "").strip()
-
-    for m in merged:
-        g = (m.get("group") or "").upper()
-        text_val = (m.get("word") or "").replace("##", "").strip()
-        if not text_val:
-            continue
-        if g in {"DATE", "DATETIME"}:
-            assign_first("date", text_val)
-        elif g in {"TIME"}:
-            assign_first("time", text_val)
-        elif g in {"LOC", "LOCATION", "VENUE", "FAC", "GPE"}:
-            assign_first("venue", text_val)
-
-    return fields
-
-
-# ---------- Main Extraction Function (order toggled by env: LLM_FIRST) ----------
-def extract_event_details(subject: Optional[str], body: Optional[str]) -> Dict[str, Optional[str]]:
-    raw = body or ""
-    text = _clean_text(raw)
-    event_name = clean_event_name(subject)
-    llm_first = os.getenv("LLM_FIRST", "false").lower() == "true"
-
-    date_str: Optional[str] = None
-    time_str: Optional[str] = None
-    venue_rule: Optional[str] = None
-    source = ""
-    confidence = 0.0
-
-    def _apply_rules():
-        nonlocal date_str, time_str, venue_rule, source, confidence
-        d, t, anchor_idx = _extract_date_and_time(text)
-        v = extract_venue(text, anchor_line_index=anchor_idx)
-        date_str = date_str or d
-        time_str = time_str or t
-        venue_rule = venue_rule or v
-        source = "rules" if not source else f"{source}+rules"
-        confidence = max(confidence, 0.85 if (date_str and time_str) else 0.6 if (date_str or time_str) else 0.4)
-
-    def _apply_llm():
-        nonlocal date_str, time_str, venue_rule, source, confidence
-        if os.getenv("LLM_FALLBACK_ENABLED", "false").lower() != "true":
-            return
-        try:
-            from llm_fallback import extract_with_gemini
-            llm = extract_with_gemini(subject or "", text)
-            if llm:
-                date_str = date_str or llm.get("date")
-                time_str = time_str or llm.get("time")
-                venue_rule = venue_rule or llm.get("venue")
-                source = "gemini" if not source else f"{source}+gemini"
-                confidence = max(confidence, 0.8)
-        except Exception:
-            pass
-
-    def _apply_ner():
-        nonlocal date_str, time_str, venue_rule, source, confidence
-        ner_entities = _call_hf_ner(text)
-        if ner_entities:
-            ner_fields = _aggregate_entities(ner_entities)
-            date_str = date_str or ner_fields.get("date")
-            time_str = time_str or ner_fields.get("time")
-            venue_rule = venue_rule or ner_fields.get("venue")
-            source = "ner" if not source else f"{source}+ner"
-            confidence = max(confidence, 0.7 if count_event_fields({"date": date_str, "time": time_str, "venue": venue_rule}) >= 2 else 0.5)
-
-    if llm_first:
-        _apply_llm()
-        if count_event_fields({"date": date_str, "time": time_str, "venue": venue_rule}) < 2:
-            _apply_rules()
-        if count_event_fields({"date": date_str, "time": time_str, "venue": venue_rule}) < 2:
-            _apply_ner()
-    else:
-        _apply_rules()
-        if count_event_fields({"date": date_str, "time": time_str, "venue": venue_rule}) < 2:
-            _apply_llm()
-        if count_event_fields({"date": date_str, "time": time_str, "venue": venue_rule}) < 2:
-            _apply_ner()
-
-    # Light normalization of time strings
-    if time_str:
-        t = str(time_str).strip()
-        if re.fullmatch(r"\d{1,2}", t):
-            t = f"{t}:00"
-        t = t.upper().replace(".", "")
-        t = re.sub(r"\s+", " ", t)
-        time_str = t
-
-    result: Dict[str, Optional[str]] = {
-        "event": event_name,
-        "event_name": event_name,
-        "date": date_str,
-        "time": time_str,
-        "venue": venue_rule,
-        "source": source,
-        "confidence": confidence,
-    }
-    return result
-
+        predict, mapping = load_ner()
+        spans = sorted(predict(input_text), key=lambda span: -span["score"])
+        for span in spans:
+            key = mapping.get(span["entity_group"].upper())
+            if key not in fields or fields[key]:
+                continue
+            value = input_text[span["start"]:span["end"]].strip()
+            if key == "date":
+                value = _extract_date_and_time(value, reference)[0]
+            elif key == "time":
+                value = _extract_best_time(value)
+            if value:
+                fields[key], sources[key] = value, "ner"
+        trace.append("ner" if spans else "ner (no entities)")
+    except Exception as error:
+        logger.warning("NER unavailable (%s)", type(error).__name__)
+        trace.append("ner unavailable")
+    if not fields["event_name"] and subject:
+        fields["event_name"] = clean_event_name(subject)
+        sources["event_name"] = "subject"
+    # A venue is optional. A specified start time should be resolved when possible.
+    needs_help = not fields["date"] or not fields["event_name"] or (
+        not fields["time"] and bool(re.search(r"\b(?:noon|midnight|o.clock|am|pm)\b", input_text, re.I)))
+    if needs_help and os.getenv("LLM_FALLBACK_ENABLED", "false").lower() == "true":
+        from llm_fallback import extract_with_gemini
+        prediction = extract_with_gemini(subject, text, reference=reference)
+        trace.append("gemini" if prediction else "gemini unavailable")
+        for key in fields:
+            value = (prediction or {}).get(key)
+            if not fields[key] and isinstance(value, str) and value.strip():
+                fields[key], sources[key] = value.strip(), "gemini"
+    return {**fields, "event": fields["event_name"], "source": "+".join(dict.fromkeys(sources.values())),
+            "field_sources": sources, "trace": trace}
 
 def count_event_fields(details: Dict[str, Optional[str]]) -> int:
     present = 0
