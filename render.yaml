@@ -2,17 +2,5 @@ services:
   - type: web
     name: eee-backend
     runtime: python
-    buildCommand: |
-      python -m pip install --upgrade pip setuptools wheel && \
-      pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.6,<3" && \
-      pip install --no-cache-dir --prefer-binary -r requirements.txt
-    startCommand: python app.py
-    envVars:
-      - key: TRANSFORMERS_CACHE
-        value: /tmp/cache
-      - key: PYTHONPATH
-        value: /opt/render/project/src
-      - key: HF_MODEL_ID
-        value: Hansika08/Distilbert-case-based_Fine-tuned_NER
-      - key: HUGGINGFACE_API_TOKEN
-        sync: false
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: gunicorn --workers 1 --threads 2 --timeout 0 --bind 0.0.0.0:$PORT app:app
