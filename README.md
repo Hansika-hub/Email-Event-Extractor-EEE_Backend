@@ -50,3 +50,7 @@ The Gmail endpoints take a Google OAuth **access token** with the `gmail.readonl
 Use the settings from `render.yaml` when creating the Python web service. If the service is configured manually, copy its build and start commands into Render. Include the `ner_model/` files in the deployed revision and configure `app.py` with the frontend's OAuth client ID and allowed origin.
 
 Gemini fallback is optional. To enable it, set `LLM_FALLBACK_ENABLED=true`, `GEMINI_MODEL_ID`, and `GOOGLE_API_KEY` in Render. Keep the key in environment variables.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
