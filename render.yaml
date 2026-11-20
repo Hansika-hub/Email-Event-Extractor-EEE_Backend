@@ -4,6 +4,7 @@ services:
     runtime: python
     buildCommand: |
       python -m pip install --upgrade pip setuptools wheel && \
+      pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.6,<3" && \
       pip install --no-cache-dir --prefer-binary -r requirements.txt
     startCommand: python app.py
     envVars:
@@ -12,6 +13,6 @@ services:
       - key: PYTHONPATH
         value: /opt/render/project/src
       - key: HF_MODEL_ID
-        value: Thiyaga158/Distilbert_Ner_Model_For_Email_Event_Extraction
+        value: Hansika08/Distilbert-case-based_Fine-tuned_NER
       - key: HUGGINGFACE_API_TOKEN
         sync: false
