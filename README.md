@@ -1,100 +1,52 @@
-# Event Email Extraction (EEE) — Backend API
+# Email Event Extraction — Backend
 
-The Flask web service backend that powers the **Event Email Extraction (EEE) - Event Reminder** application. 
+A Flask API that reads unread Gmail messages and extracts event names, dates, times, and venues. The frontend presents the results for review and handles saving to Google Calendar.
 
-This backend acts as the extraction pipeline, communicating with the Gmail API to pull unread messages and processing their content to extract event information (`date`, `time`, and `venue`) via a multi-tiered pipeline consisting of rules, a custom NER (Named Entity Recognition) model, and a generative LLM (Gemini) fallback.
+- [Frontend repository](https://github.com/Hansika-hub/Email)
+- [Live app on Vercel](https://YOUR-FRONTEND.vercel.app)
+- [Backend on Render](https://YOUR-BACKEND.onrender.com)
 
----
+## Extraction pipeline
 
-## 🚀 Core Features
+1. Fetch unread messages using the user's Gmail OAuth access token.
+2. Read structured event details from calendar invitations when available. For email text, combine date and time parsing rules with a fine-tuned DistilBERT model.
+3. Optionally call Gemini when important fields remain unresolved. Return the extracted fields and their sources when available.
+4. Cache successful extractions in SQLite to avoid reprocessing the same messages on repeated scans.
 
-*   **Secure Session & OAuth Flow**: Verifies Google Identity ID tokens and validates user authentication.
-*   **Gmail Integration**: Reads unread mail headers, decodes text/html payloads, and extracts attached or embedded ICS calendar events.
-*   **Hybrid Extraction Pipeline**:
-    1.  **Rule-based parser**: Uses `dateparser` and regex heuristics to look for dates, times, and venue keywords (hall, room, lab, etc.) within line proximity.
-    2.  **NER Model**: Submits texts to a custom DistilBERT model (`Thiyaga158/Distilbert_Ner_Model_For_Email_Event_Extraction`) hosted on the Hugging Face Inference API.
-    3.  **LLM Fallback (Gemini)**: Utilizes `gemini-1.5-flash` to extract structured details from complex or unstructured email layouts.
-*   **SQLite Storage**: Saves successfully parsed event objects to a local sqlite database (`events.db`).
-*   **Auto-Cleanup Scheduler**: Deletes expired event entries (older than 1 hour past the event execution window).
-*   **Cache Optimization**: Caches Gmail messages by message ID to prevent duplicate extraction requests.
+The backend runs DistilBERT locally with 8-bit ONNX weights. On Render, Gunicorn uses one worker and the application allows one scan at a time to limit peak memory use.
 
----
+## Run locally
 
-## 🛠️ Technology Stack
+Use Python 3.11 or newer and clone this repository.
 
-*   **Language**: Python 3.10
-*   **Framework**: Flask (with Flask-CORS)
-*   **Libraries**:
-    *   `google-api-python-client` & `google-auth` (Gmail API client)
-    *   `google-generativeai` (Gemini API integration)
-    *   `dateparser` (semantic date searches)
-    *   `beautifulsoup4` (cleaning HTML formatting)
-    *   `icalendar` (ICS attachments parsing)
-    *   `sqlite3` (database storage)
-*   **Deployment Configuration**: Render blueprint (`render.yaml`)
-
----
-
-## 🗺️ API Endpoints
-
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `GET` | `/` | Health check endpoint. |
-| `POST` | `/` | Google ID Token authentication. |
-| `GET/POST`| `/fetch_emails` | Retrieves subjects and IDs of up to 10 unread emails. |
-| `GET/POST`| `/process_emails`| Pulls emails, decodes text/ICS, runs extraction pipeline, writes to DB, returns list of events. |
-| `GET/POST`| `/debug_token` | Debugs credentials by querying Google Tokeninfo. |
-| `POST` | `/cleanup_reminders` | Clears expired event entries from SQLite. |
-
----
-
-## ⚙️ Environment Variables
-
-Create a `.env` file in the root folder to configure the backend:
-
-```env
-PORT=5000
-GOOGLE_API_KEY=your_gemini_api_key_here
-LLM_FALLBACK_ENABLED=true
-LLM_FIRST=false
-HUGGINGFACE_API_TOKEN=your_huggingface_token_here
-DEBUG_NER=0
+```bash
+git clone https://github.com/Hansika-hub/Email_Backend.git
+cd Email_Backend
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python app.py
 ```
 
----
+Place `model.onnx`, `config.json`, and `tokenizer.json` in `ner_model/` alongside `app.py`. Use the exported ONNX model and its matching tokenizer and label configuration.
 
-## 💻 Local Setup
+```bash
+curl http://localhost:5000/
+```
 
-1.  **Clone the Repository**:
-    ```bash
-    git clone https://github.com/Hansika-hub/Email_Backend.git
-    cd Email_Backend
-    ```
+## API
 
-2.  **Set Up Virtual Environment**:
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate
-    ```
+| Method and path | Purpose |
+| --- | --- |
+| `GET /` | Health check |
+| `POST /` | Verify a Google ID token from the sign-in flow |
+| `GET /fetch_emails` | List IDs and subjects for up to 10 unread messages |
+| `GET /process_emails` | Scan up to 20 unread messages and return extracted events |
 
-3.  **Install Dependencies**:
-    ```bash
-    pip install -r requirements.txt
-    ```
+The Gmail endpoints take a Google OAuth **access token** with the `gmail.readonly` scope in the `Authorization: Bearer …` header.
 
-4.  **Configure Environment**:
-    Rename/create `.env` and fill in your API tokens.
+## Deploy on Render
 
-5.  **Run the Server**:
-    ```bash
-    python app.py
-    ```
-    The application will launch on `http://localhost:5000`.
+Use the settings from `render.yaml` when creating the Python web service. If the service is configured manually, copy its build and start commands into Render. Include the `ner_model/` files in the deployed revision and configure `app.py` with the frontend's OAuth client ID and allowed origin.
 
----
-
-## ☁️ Deployment
-
-This service can be easily deployed to **Render** using the included `render.yaml` configuration:
-*   The blueprint provisions a python web service named `eee-backend`.
-*   Includes build scripting and registers target environment variables (`HF_MODEL_ID`, etc.).
+Gemini fallback is optional. To enable it, set `LLM_FALLBACK_ENABLED=true`, `GEMINI_MODEL_ID`, and `GOOGLE_API_KEY` in Render. Keep the key in environment variables.
