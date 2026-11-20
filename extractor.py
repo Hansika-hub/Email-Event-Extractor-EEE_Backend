@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 from dateparser.search import search_dates
 import datetime as _dt
 from functools import lru_cache
+from pathlib import Path
 import logging
 
 # Debug logging toggle
@@ -205,7 +206,8 @@ def extract_venue(text: str, anchor_line_index: Optional[int] = None) -> Optiona
     return None
 
 
-MODEL_ID = os.getenv("HF_MODEL_ID", "Hansika08/Distilbert-case-based_Fine-tuned_NER")
+# The bundled INT8 graph was exported from Hansika08/Distilbert-case-based_Fine-tuned_NER,
+# revision f2eab014c7979e5dd5d60a9820e14627c9aa52e2.
 LABEL_FIELDS = {
     "EVENT": "event_name", "EVENT_NAME": "event_name", "EVENTNAME": "event_name",
     "TITLE": "event_name", "DATE": "date", "TIME": "time", "LOCATION": "venue",
@@ -214,27 +216,71 @@ LABEL_FIELDS = {
 
 @lru_cache(maxsize=1)
 def load_ner():
-    from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
-    options = {"revision": os.getenv("HF_MODEL_REVISION", "main"),
-               "token": os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_TOKEN")}
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True, **options)
-    model, info = AutoModelForTokenClassification.from_pretrained(
-        MODEL_ID, output_loading_info=True, **options)
-    if any("classifier" in key for key in info["missing_keys"]):
-        raise ValueError("Missing trained token classifier weights")
-    if model.config.model_type != "distilbert":
+    import numpy as np
+    import onnxruntime as ort
+    from tokenizers import Tokenizer
+
+    directory = Path(__file__).with_name("ner_model")
+    config = json.loads((directory / "config.json").read_text())
+    if config["model_type"] != "distilbert":
         raise ValueError("Expected a DistilBERT checkpoint")
+    labels = config["id2label"]
     mapping = {**LABEL_FIELDS, **json.loads(os.getenv("NER_LABEL_MAP", "{}"))}
-    labels = {re.sub(r"^[BI]-", "", label).upper() for label in model.config.id2label.values()}
-    unknown = labels - {"O"} - mapping.keys()
+    ignored = {"O", "ONLINE_LINK", "DEADLINE", "OTHER_DATE"}
+    unknown = {re.sub(r"^[BI]-", "", label).upper() for label in labels.values()} - ignored - mapping.keys()
     if unknown:
         raise ValueError(f"Configure NER_LABEL_MAP for {sorted(unknown)}")
-    return pipeline("token-classification", model=model, tokenizer=tokenizer,
-                    aggregation_strategy="simple", stride=64, device=-1), mapping
+
+    tokenizer = Tokenizer.from_file(str(directory / "tokenizer.json"))
+    tokenizer.no_padding()
+    tokenizer.enable_truncation(max_length=min(256, config["max_position_embeddings"]), stride=48)
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    options.enable_cpu_mem_arena = False
+    session = ort.InferenceSession(str(directory / "model.onnx"), sess_options=options,
+                                   providers=["CPUExecutionProvider"])
+
+    def predict(text):
+        first = tokenizer.encode(text)
+        spans = []
+        for window in (first, *first.overflowing):
+            inputs = {"input_ids": window.ids, "attention_mask": window.attention_mask}
+            feed = {i.name: np.asarray([inputs[i.name]], dtype=np.int64) for i in session.get_inputs()}
+            logits = session.run(None, feed)[0][0]
+            scores = np.exp(logits - logits.max(axis=1, keepdims=True))
+            scores /= scores.sum(axis=1, keepdims=True)
+            current = None
+            for (start, end), special, row in zip(window.offsets, window.special_tokens_mask, scores):
+                index = int(row.argmax())
+                label = labels[str(index)]
+                if special or label == "O":
+                    current = None
+                    continue
+                group = re.sub(r"^[BI]-", "", label)
+                if current is None or label.startswith("B-") or current["entity_group"] != group:
+                    current = {"start": start, "end": end, "entity_group": group, "scores": []}
+                    spans.append(current)
+                current["end"] = end
+                current["scores"].append(float(row[index]))
+        # Keep complete entities when overlapping windows cover the same tokens.
+        kept = []
+        for span in sorted(spans, key=lambda s: (s["start"], -s["end"])):
+            values = span.pop("scores")
+            span["score"] = sum(values) / len(values)
+            if kept and kept[-1]["end"] > span["start"]:
+                old = kept[-1]
+                if (span["end"]-span["start"], span["score"]) > (old["end"]-old["start"], old["score"]):
+                    kept[-1] = span
+            else:
+                kept.append(span)
+        return kept
+
+    return predict, mapping
 
 
 def extract_event_details(subject, body, reference=None):
-    text = _clean_text(body)
+    text = _clean_text((body or "")[:32768])
     input_text = (subject or "") + "\n" + text
     date, time, anchor = _extract_date_and_time(input_text, reference)
     fields = {"event_name": None, "date": date, "time": time,
