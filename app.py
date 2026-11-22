@@ -3,6 +3,7 @@ from gmail_utils import get_gmail_service
 from extractor import extract_event_details, is_event_like, count_event_fields
 from flask_cors import CORS
 import os
+from dotenv import load_dotenv
 from db_utils import DB_NAME, save_to_db
 import requests
 import logging
@@ -19,9 +20,13 @@ from icalendar import Calendar
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
-app = Flask(__name__)
-app.secret_key = "super_secret"
+load_dotenv()
 
+app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY")
+
+if not app.secret_key:
+    raise RuntimeError("FLASK_SECRET_KEY is not configured")
 # ✅ Secure session settings (if ever needed)
 app.config.update(
     SESSION_COOKIE_SECURE=True,
